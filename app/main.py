@@ -21,7 +21,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from .config import db_path, published_dir, staging_dir
+from .config import db_path, max_open_outputs, published_dir, staging_dir
 from .db import db_conn, init_db
 from .demux import demultiplex
 from .samples import load_samples
@@ -114,6 +114,7 @@ def write_log(path: Path, run, sample_list, stats) -> None:
     ]
     lines += [f"  {sid}\t{idx}" for sid, idx in sample_list]
     lines.append(f"总读段对: {stats['total_pairs']}")
+    lines.append(f"峰值同时打开输出文件: {stats.get('peak_open_outputs', 0)}")
     lines.append("分组对数(对数\t其中单碱基纠错):")
     for sid in stats["order"]:
         pairs, corrected = stats["counts"][sid]
@@ -133,15 +134,29 @@ def process_run(run_id: int) -> None:
     final = published_dir() / run_number
     try:
         sample_list = load_samples(uploads / "samples.csv")
+        # 同号重试:清掉上一次失败可能残留的发布目录,避免旧文件混入新结果
+        _remove(final)
         out.mkdir(parents=True)
         stats = demultiplex(
             str(uploads / "r1.fastq"), str(uploads / "r2.fastq"),
             str(uploads / "i1.fastq"), sample_list, str(out),
+            max_open_outputs=max_open_outputs(),
         )
         write_log(out / "demux.log", run, sample_list, stats)
+        # 发布前确认每组 R1/R2 都真实存在(含零读段组),再原子改名
+        missing = [
+            f"{sid}_{mate}.fastq"
+            for sid in stats["order"] for mate in ("R1", "R2")
+            if not (out / f"{sid}_{mate}.fastq").is_file()
+        ]
+        if missing:
+            raise RuntimeError(f"输出不完整,缺少: {', '.join(missing[:5])}")
         if final.exists():
             raise RuntimeError(f"发布目录已存在: {final}")
-        os.rename(out, final)  # 同一数据卷内原子移动:先完整落盘,再发布
+        try:
+            os.rename(out, final)  # 同一数据卷内原子移动:先完整落盘,再发布
+        except OSError as exc:
+            raise RuntimeError(f"发布目录移动失败: {exc}") from exc
         with db_conn(db_path()) as conn:
             updated = conn.execute(
                 "UPDATE runs SET status='published', total_pairs=?, published_at=?, "

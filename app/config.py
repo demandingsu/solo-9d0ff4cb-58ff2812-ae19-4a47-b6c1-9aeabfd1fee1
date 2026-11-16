@@ -21,3 +21,18 @@ def published_dir() -> Path:
 
 def db_path() -> Path:
     return data_dir() / "app.db"
+
+
+# 同时打开的拆样输出文件上限。三份输入另占 3 个句柄,默认值在 nofile=64
+# 的容器里也有充足余量;可用环境变量按需调整。
+DEFAULT_MAX_OPEN_OUTPUTS = 16
+
+
+def max_open_outputs() -> int:
+    """DEMUX_MAX_OPEN_OUTPUTS 覆盖输出句柄上限;缺失或非法时用默认值。"""
+    raw = os.environ.get("DEMUX_MAX_OPEN_OUTPUTS", "")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_OPEN_OUTPUTS
+    return value if value >= 1 else DEFAULT_MAX_OPEN_OUTPUTS

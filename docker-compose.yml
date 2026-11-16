@@ -7,6 +7,13 @@ services:
       - "8000:8000"
     volumes:
       - demux_data:/app/data   # SQLite + 暂存区 + 发布区,同一数据卷保证原子改名
+    # 收紧文件描述符上限,与自测条件一致;程序用有界句柄池,64 足够
+    ulimits:
+      nofile:
+        soft: 64
+        hard: 64
+    environment:
+      - DEMUX_MAX_OPEN_OUTPUTS=${DEMUX_MAX_OPEN_OUTPUTS:-16}
     restart: unless-stopped
 
 volumes:

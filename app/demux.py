@@ -3,14 +3,26 @@
 输入为三份未压缩的 4 行 FASTQ(R1/R2/I1)。任何结构损坏、读段号不一致、
 序列与质量长度不符都会抛 FastqFormatError,由上层把运行标记为失败,
 保证不发布半套文件。
+
+输出句柄策略:样本数可能有数百个,不能为每个样本常开 R1/R2 两个文件。
+所有输出文件先以空文件建好(零读段组也有文件),写记录时通过有界 LRU
+句柄池按需以追加方式打开,最多同时占用 ``max_open_outputs`` 个句柄。
+同一分组始终按读段到达顺序追加,因此中途被换出再打开也不会打乱顺序。
 """
 from __future__ import annotations
 
 import os
+from collections import OrderedDict
 from itertools import zip_longest
 
 BASES = "ACGT"
 _MISSING = object()  # zip_longest 哨兵:某份文件先读完
+
+# 默认最多同时打开 16 个输出文件:3 个输入 + 16 个输出,在 nofile=64
+# 的容器里仍留出足够余量给解释器、监听套接字和数据库连接。
+# 实际取值由 config.max_open_outputs() 从 DEMUX_MAX_OPEN_OUTPUTS 读取,
+# 再经 demultiplex(..., max_open_outputs=...) 传入。
+OUTPUT_BUFFER_BYTES = 1 << 16
 
 
 class FastqFormatError(Exception):
@@ -77,29 +89,101 @@ def assign_index(index, exact, neighbors):
     return None, False
 
 
-def demultiplex(r1_path, r2_path, i1_path, samples, out_dir):
+def _default_max_open_outputs() -> int:
+    """环境变量可覆盖句柄上限;非法值回落到默认值。"""
+    from .config import max_open_outputs
+
+    return max_open_outputs()
+
+
+def _prepare_outputs(out_dir, order):
+    """为每个分组预建空的 R1/R2 文件,返回 {组: (r1路径, r2路径)}。
+
+    逐个用 with 打开后立刻关闭,不会累积句柄;这样零读段组也一定有文件。
+    """
+    paths = {}
+    for sid in order:
+        r1 = os.path.join(out_dir, f"{sid}_R1.fastq")
+        r2 = os.path.join(out_dir, f"{sid}_R2.fastq")
+        for path in (r1, r2):
+            with open(path, "w", encoding="ascii"):
+                pass
+        paths[sid] = (r1, r2)
+    return paths
+
+
+class _OutputPool:
+    """有界 LRU 输出句柄池:超出上限时关闭最久未用的文件。
+
+    ``write`` 中的打开/写入/换出错误都会直接抛给调用方;调用方在失败路径
+    用 ``close_quietly`` 收尾,避免关闭错误掩盖最初的异常。
+    """
+
+    def __init__(self, max_open: int):
+        self._max_open = max(1, int(max_open))
+        self._handles: OrderedDict[str, object] = OrderedDict()
+        self.peak = 0
+
+    def write(self, path: str, text: str) -> None:
+        fh = self._handles.get(path)
+        if fh is None:
+            if len(self._handles) >= self._max_open:
+                _, stale = self._handles.popitem(last=False)
+                stale.close()  # 换出前落盘;写失败在此暴露
+            fh = open(
+                path, "a", encoding="ascii", buffering=OUTPUT_BUFFER_BYTES
+            )
+            self._handles[path] = fh
+            self.peak = max(self.peak, len(self._handles))
+        else:
+            self._handles.move_to_end(path)
+        fh.write(text)
+
+    def close(self) -> None:
+        """关闭全部句柄;若有多个关闭失败,报第一个,其余仍会关闭。"""
+        first_error = None
+        while self._handles:
+            _, fh = self._handles.popitem(last=False)
+            try:
+                fh.close()
+            except Exception as exc:  # noqa: BLE001 - 需要关闭其余句柄后再抛
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
+
+    def close_quietly(self) -> None:
+        while self._handles:
+            _, fh = self._handles.popitem(last=False)
+            try:
+                fh.close()
+            except Exception:  # noqa: BLE001 - 失败路径只做清理
+                pass
+
+
+def demultiplex(r1_path, r2_path, i1_path, samples, out_dir,
+                max_open_outputs=None):
     """逐对拆分。samples 为 [(样本号, 索引序列)],输出写入 out_dir。
 
-    返回 {'total_pairs', 'counts': {组: [对数, 纠错对数]}, 'order': [组...]}。
+    返回 {'total_pairs', 'counts': {组: [对数, 纠错对数]}, 'order': [组...],
+    'peak_open_outputs': 峰值句柄数}。
     输出文件按输入顺序追加,保证各组内读段顺序与原始一致。
     """
     exact, neighbors = build_matcher(samples)
     order = [sid for sid, _ in samples] + ["undetermined"]
-    writers = {}
     counts = {sid: [0, 0] for sid in order}
+    paths = _prepare_outputs(out_dir, order)
+    if max_open_outputs is None:
+        max_open_outputs = _default_max_open_outputs()
+    pool = _OutputPool(max_open_outputs)
+    readers = {
+        "R1": iter_fastq(r1_path, "R1"),
+        "R2": iter_fastq(r2_path, "R2"),
+        "I1": iter_fastq(i1_path, "I1"),
+    }
+    total = 0
     try:
-        for sid in order:
-            writers[sid] = (
-                open(os.path.join(out_dir, f"{sid}_R1.fastq"), "w", encoding="ascii", buffering=1 << 20),
-                open(os.path.join(out_dir, f"{sid}_R2.fastq"), "w", encoding="ascii", buffering=1 << 20),
-            )
-        total = 0
-        streams = zip_longest(
-            iter_fastq(r1_path, "R1"),
-            iter_fastq(r2_path, "R2"),
-            iter_fastq(i1_path, "I1"),
-            fillvalue=_MISSING,
-        )
+        streams = zip_longest(*readers.values(), fillvalue=_MISSING)
         for rec1, rec2, reci in streams:
             if rec1 is _MISSING or rec2 is _MISSING or reci is _MISSING:
                 raise FastqFormatError(f"第 {total + 1} 条起,三份文件的记录数不一致")
@@ -114,14 +198,23 @@ def demultiplex(r1_path, r2_path, i1_path, samples, out_dir):
                 )
             sid, corrected = assign_index(si.upper(), exact, neighbors)
             key = sid if sid is not None else "undetermined"
-            w1, w2 = writers[key]
-            w1.write(f"@{h1}\n{s1}\n{p1}\n{q1}\n")
-            w2.write(f"@{h2}\n{s2}\n{p2}\n{q2}\n")
+            w1, w2 = paths[key]
+            pool.write(w1, f"@{h1}\n{s1}\n{p1}\n{q1}\n")
+            pool.write(w2, f"@{h2}\n{s2}\n{p2}\n{q2}\n")
             counts[key][0] += 1
             if corrected:
                 counts[key][1] += 1
+    except BaseException:
+        pool.close_quietly()  # 不掩盖原始异常
+        raise
+    else:
+        pool.close()  # 所有缓冲在此落盘;写入失败会抛给上层,阻止发布
     finally:
-        for pair in writers.values():
-            for fh in pair:
-                fh.close()
-    return {"total_pairs": total, "counts": counts, "order": order}
+        for reader in readers.values():
+            reader.close()
+    return {
+        "total_pairs": total,
+        "counts": counts,
+        "order": order,
+        "peak_open_outputs": pool.peak,
+    }

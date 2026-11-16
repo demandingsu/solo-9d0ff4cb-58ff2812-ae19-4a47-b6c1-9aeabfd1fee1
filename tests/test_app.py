@@ -1,5 +1,4 @@
 """关键情形自测:拆分正确性、纠错规则、损坏处理、原子发布、恢复、不可改写。"""
-import os
 import sys
 import time
 from pathlib import Path
@@ -283,3 +282,223 @@ def test_index_page(client):
     resp = client.get("/")
     assert resp.status_code == 200
     assert "新建拆样运行" in resp.text
+
+
+# ------------------------------------------------------------ 句柄有界与交错
+
+def _many_samples(n, length=8):
+    """生成 n 个长度唯一、仅含 ACGT 的索引(按四进制编码样本号)。"""
+    samples, seen = [], set()
+    for i in range(n):
+        x, chars = i, []
+        for _ in range(length):
+            chars.append("ACGT"[x % 4])
+            x //= 4
+        index = "".join(chars)
+        assert index not in seen
+        seen.add(index)
+        samples.append((f"S{i:04d}", index))
+    return samples
+
+
+def _write_interleaved_inputs(dir_path, samples, pairs):
+    """第 r 对循环落到不同样本,使输出句柄反复换入换出。"""
+    expected = {}
+    with open(dir_path / "r1.fastq", "w") as r1, \
+         open(dir_path / "r2.fastq", "w") as r2, \
+         open(dir_path / "i1.fastq", "w") as i1:
+        for r in range(pairs):
+            sid, idx = samples[(r * 7) % len(samples)]
+            if r % 13 == 0:  # 少量无候选读段进未分配组
+                sid, idx = "undetermined", "T" * len(idx)
+            head = f"INST:1:FC:1:1101:{r}:{r}"
+            r1.write(f"@{head} 1:N:0:0\nACGTACGTAC\n+\nIIIIIIIIII\n")
+            r2.write(f"@{head} 2:N:0:0\nTGCATGCATG\n+\nIIIIIIIIII\n")
+            i1.write(f"@{head} 1:N:0:0\n{idx}\n+\n{'I' * len(idx)}\n")
+            expected[sid] = expected.get(sid, 0) + 1
+    return expected
+
+
+def test_bounded_output_handles_interleaved(tmp_path):
+    """数百样本反复交错时,输出句柄峰值受控、顺序与计数不变、空组也有文件。"""
+    from app.demux import demultiplex
+
+    samples = _many_samples(300)
+    expected = _write_interleaved_inputs(tmp_path, samples, pairs=1500)
+    out = tmp_path / "out"
+    out.mkdir()
+
+    stats = demultiplex(
+        str(tmp_path / "r1.fastq"), str(tmp_path / "r2.fastq"),
+        str(tmp_path / "i1.fastq"), samples, str(out), max_open_outputs=4,
+    )
+
+    assert stats["total_pairs"] == 1500
+    assert stats["peak_open_outputs"] <= 4  # 与句柄上限严格一致
+    assert stats["order"][-1] == "undetermined"
+    for sid, (pairs, _corrected) in stats["counts"].items():
+        assert pairs == expected.get(sid, 0), sid
+        r1 = out / f"{sid}_R1.fastq"
+        r2 = out / f"{sid}_R2.fastq"
+        assert r1.is_file() and r2.is_file()  # 零读段组也有文件
+        ids = parse_fastq_ids(r1.read_text())
+        nums = [int(x.rsplit(":", 1)[1]) for x in ids]
+        assert len(ids) == pairs
+        assert nums == sorted(nums), sid  # 组内保持输入顺序
+
+
+def test_under_nofile_64(tmp_path):
+    """把进程 fd 上限压到 64,数百样本仍能完成拆分(原实现会 EMFILE)。"""
+    import resource
+    from app.demux import demultiplex
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    try:
+        limit = 64 if hard in (resource.RLIM_INFINITY, -1) else min(64, hard)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (limit, hard))
+        samples = _many_samples(400)
+        expected = _write_interleaved_inputs(tmp_path, samples, pairs=2000)
+        out = tmp_path / "out"
+        out.mkdir()
+        stats = demultiplex(
+            str(tmp_path / "r1.fastq"), str(tmp_path / "r2.fastq"),
+            str(tmp_path / "i1.fastq"), samples, str(out),
+        )
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+    assert stats["total_pairs"] == 2000
+    assert stats["peak_open_outputs"] <= 16
+    assert sum(v[0] for v in stats["counts"].values()) == 2000
+    assert all(stats["counts"][sid][0] == pairs for sid, pairs in expected.items())
+    assert len(list(out.iterdir())) == 2 * len(stats["order"])
+
+
+def test_tail_corruption_and_retry_consistency(client):
+    """末尾损坏 → 不发布;同号重试后页面计数与下载内容一致。"""
+    r1, r2, i1, csv = make_inputs()
+    # 破坏末条 I1 的质量行:改成长度不符,前面记录全部合法
+    bad_i1 = i1.rstrip(b"\n")
+    bad_i1 = bad_i1[: bad_i1.rfind(b"\n")] + b"\nIII\n"
+    rid = run_id_of(submit(client, "RUN9", r1, r2, bad_i1, csv))
+    st = wait_done(client, rid)
+    assert st["status"] == "failed" and "长度" in st["error"]
+    assert not (client.data_dir / "published" / "RUN9").exists()
+    assert not any((client.data_dir / "staging").iterdir())
+    assert client.get(f"/runs/{rid}/download/S1_R1.fastq").status_code == 409
+
+    rid2 = run_id_of(submit_good(client, "RUN9"))
+    st2 = wait_done(client, rid2)
+    assert st2["status"] == "published"
+    page = client.get(f"/runs/{rid2}").text
+    for sid, (pairs, corrected) in counts_of(st2).items():
+        assert f"<td>{sid}</td>" in page
+        r1_text = client.get(f"/runs/{rid2}/download/{sid}_R1.fastq").text
+        r2_text = client.get(f"/runs/{rid2}/download/{sid}_R2.fastq").text
+        assert len(parse_fastq_ids(r1_text)) == pairs
+        assert len(parse_fastq_ids(r2_text)) == pairs
+        assert parse_fastq_ids(r1_text) == parse_fastq_ids(r2_text)
+        assert f"<td>{pairs}</td>" in page
+        assert f"<td>{corrected}</td>" in page
+
+
+def test_write_failure_does_not_publish(client, monkeypatch):
+    """输出写入在末尾失败(模拟磁盘写满):不发布半套文件,重试可成功。"""
+    from app.demux import _OutputPool
+
+    real_write = _OutputPool.write
+    calls = {"n": 0}
+
+    def failing_write(self, path, text):
+        calls["n"] += 1
+        if calls["n"] >= 9:  # 前几条正常,模拟处理到尾段时写盘失败
+            raise OSError(28, "No space left on device")
+        return real_write(self, path, text)
+
+    monkeypatch.setattr(_OutputPool, "write", failing_write)
+    rid = run_id_of(submit_good(client, "RUN10"))
+    st = wait_done(client, rid)
+    assert st["status"] == "failed" and "No space left" in st["error"]
+    assert not (client.data_dir / "published" / "RUN10").exists()
+    assert not any((client.data_dir / "staging").iterdir())
+
+    monkeypatch.setattr(_OutputPool, "write", real_write)  # 修复后同号重试
+    rid2 = run_id_of(submit_good(client, "RUN10"))
+    st2 = wait_done(client, rid2)
+    assert st2["status"] == "published"
+    assert counts_of(st2) == {
+        "S1": (3, 1), "S2": (1, 0), "S3": (1, 1), "undetermined": (2, 0),
+    }
+    for sid, (pairs, _c) in counts_of(st2).items():
+        assert len(parse_fastq_ids(
+            client.get(f"/runs/{rid2}/download/{sid}_R1.fastq").text)) == pairs
+
+
+def test_flush_failure_on_close_does_not_publish(client, monkeypatch):
+    """末尾缓冲落盘失败(close 时写盘):运行标失败、不发布、暂存清理干净。"""
+    from app.demux import _OutputPool
+
+    real_close = _OutputPool.close
+
+    def failing_close(self):
+        real_close(self)  # 句柄确实都关了,不掩盖后续异常
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(_OutputPool, "close", failing_close)
+    rid = run_id_of(submit_good(client, "RUN13"))
+    st = wait_done(client, rid)
+    assert st["status"] == "failed" and "No space left" in st["error"]
+    assert not (client.data_dir / "published" / "RUN13").exists()
+    assert not any((client.data_dir / "staging").iterdir())
+
+    monkeypatch.setattr(_OutputPool, "close", real_close)
+    rid2 = run_id_of(submit_good(client, "RUN13"))
+    st2 = wait_done(client, rid2)
+    assert st2["status"] == "published" and st2["total_pairs"] == 7
+
+
+def test_zero_read_groups_have_empty_files(client):
+    """从未命中的样本发布后仍有空 R1/R2 文件可下载,计数为 0。"""
+    r1, r2, i1, _csv = make_inputs()
+    csv = b"sample_id,index\nS1,AAAACCCC\nS2,AAAACCGG\nS3,GGGGTTTT\nS4,TTTTGGGG\n"
+    rid = run_id_of(submit(client, "RUN11", r1, r2, i1, csv))
+    st = wait_done(client, rid)
+    assert st["status"] == "published"
+    assert counts_of(st)["S4"] == (0, 0)
+    for mate in ("R1", "R2"):
+        resp = client.get(f"/runs/{rid}/download/S4_{mate}.fastq")
+        assert resp.status_code == 200 and resp.content == b""
+
+
+def test_api_many_samples_under_nofile_64(client):
+    """端到端:API 上传 120 个样本、读段交错,在 nofile=64 下发布完整结果。"""
+    import resource
+
+    samples = _many_samples(120)
+    tmp = Path(client.data_dir.parent) / "inputs"
+    tmp.mkdir()
+    expected = _write_interleaved_inputs(tmp, samples, pairs=600)
+    csv = "".join(f"{sid},{idx}\n" for sid, idx in samples).encode()
+    r1 = (tmp / "r1.fastq").read_bytes()
+    r2 = (tmp / "r2.fastq").read_bytes()
+    i1 = (tmp / "i1.fastq").read_bytes()
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    try:
+        limit = 64 if hard in (resource.RLIM_INFINITY, -1) else min(64, hard)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (limit, hard))
+        rid = run_id_of(submit(client, "RUN12", r1, r2, i1, csv))
+        st = wait_done(client, rid)
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+    assert st["status"] == "published", st["error"]
+    assert st["total_pairs"] == 600
+    got = counts_of(st)
+    assert got.get("undetermined") == (expected.get("undetermined", 0), 0)
+    assert sum(p for p, _c in got.values()) == 600
+    for sid, _idx in samples:
+        assert got[sid][0] == expected.get(sid, 0)
+        assert len(parse_fastq_ids(
+            client.get(f"/runs/{rid}/download/{sid}_R1.fastq").text)) == got[sid][0]
+    log = client.get(f"/runs/{rid}/download/demux.log").text
+    assert "峰值同时打开输出文件:" in log
